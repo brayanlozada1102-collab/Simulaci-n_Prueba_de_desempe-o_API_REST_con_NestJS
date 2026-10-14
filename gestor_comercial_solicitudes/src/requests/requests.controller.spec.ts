@@ -13,6 +13,8 @@ describe('RequestsController', () => {
     findAll: vi.fn(),
     findOne: vi.fn(),
     updateStatus: vi.fn(),
+    assignAdvisor: vi.fn(),
+    getHistory: vi.fn(),
   };
 
   const mockConfigService = {
@@ -23,6 +25,12 @@ describe('RequestsController', () => {
     username: 'advisor_john',
     role: UserRole.ADVISOR,
     name: 'John Advisor',
+  };
+
+  const mockSupervisor: User = {
+    username: 'supervisor',
+    role: UserRole.SUPERVISOR,
+    name: 'Supervisor',
   };
 
   beforeEach(async () => {
@@ -58,11 +66,14 @@ describe('RequestsController', () => {
     expect(result.id).toBe(1);
   });
 
-  it('findAll should call service with user', async () => {
-    mockRequestsService.findAll.mockResolvedValue([]);
-    const result = await controller.findAll(mockUser);
-    expect(mockRequestsService.findAll).toHaveBeenCalledWith(mockUser);
-    expect(result).toEqual([]);
+  it('findAll should call service with filterDto and user', async () => {
+    const filterDto = { page: 1, limit: 10 };
+    const paginated = { items: [], pagination: { page: 1, limit: 10, total: 0, totalPages: 0 } };
+    mockRequestsService.findAll.mockResolvedValue(paginated);
+
+    const result = await controller.findAll(filterDto, mockUser);
+    expect(mockRequestsService.findAll).toHaveBeenCalledWith(filterDto, mockUser);
+    expect(result).toEqual(paginated);
   });
 
   it('findOne should call service with id and user', async () => {
@@ -72,9 +83,28 @@ describe('RequestsController', () => {
     expect(result.id).toBe(5);
   });
 
+  it('assignAdvisor should call service with id, dto and user (RN-07)', async () => {
+    const assignDto = { asesorId: 'asesor02', getAssignedAdvisor: () => 'asesor02' } as any;
+    mockRequestsService.assignAdvisor.mockResolvedValue({ id: 5, advisor: 'asesor02' });
+
+    const result = await controller.assignAdvisor(5, assignDto, mockSupervisor);
+    expect(mockRequestsService.assignAdvisor).toHaveBeenCalledWith(5, assignDto, mockSupervisor);
+    expect(result.advisor).toBe('asesor02');
+  });
+
+  it('getHistory should call service with id and user (RN-09)', async () => {
+    const history = [{ id: 1, solicitudId: 5, tipoEvento: 'CREACION' }];
+    mockRequestsService.getHistory.mockResolvedValue(history);
+
+    const result = await controller.getHistory(5, mockUser);
+    expect(mockRequestsService.getHistory).toHaveBeenCalledWith(5, mockUser);
+    expect(result).toEqual(history);
+  });
+
   it('updateStatus should call service with id, dto and user', async () => {
-    const dto = { status: RequestStatus.IN_PROGRESS };
+    const dto = { status: RequestStatus.IN_PROGRESS, getResolvedStatus: () => RequestStatus.IN_PROGRESS } as any;
     mockRequestsService.updateStatus.mockResolvedValue({ id: 5, status: RequestStatus.IN_PROGRESS });
+
     const result = await controller.updateStatus(5, dto, mockUser);
     expect(mockRequestsService.updateStatus).toHaveBeenCalledWith(5, dto, mockUser);
     expect(result.status).toBe(RequestStatus.IN_PROGRESS);

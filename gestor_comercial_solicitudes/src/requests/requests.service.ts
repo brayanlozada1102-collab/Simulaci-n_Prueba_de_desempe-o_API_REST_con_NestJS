@@ -1,67 +1,198 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { DataSource, Repository } from 'typeorm';
 import { Request, RequestStatus } from './entities/request.entity.js';
+import {
+  EventoTipo,
+  SolicitudHistorial,
+} from './entities/solicitud-historial.entity.js';
 import { CreateRequestDto } from './dto/create-request.dto.js';
 import { UpdateStatusRequestDto } from './dto/update-status-request.dto.js';
-import { User, UserRole } from '../common/auth/users.data.js';
+import { AssignRequestDto } from './dto/assign-request.dto.js';
+import { FilterRequestsDto } from './dto/filter-requests.dto.js';
+import { IN_MEMORY_USERS, User, UserRole } from '../common/auth/users.data.js';
+
+export interface PaginatedResult<T> {
+  items: T[];
+  pagination: {
+    page: number;
+    limit: number;
+    total: number;
+    totalPages: number;
+  };
+  page: number;
+  limit: number;
+  total: number;
+  totalPages: number;
+}
 
 @Injectable()
 export class RequestsService {
   constructor(
     @InjectRepository(Request)
     private readonly requestRepository: Repository<Request>,
+    @InjectRepository(SolicitudHistorial)
+    private readonly historyRepository: Repository<SolicitudHistorial>,
+    private readonly dataSource: DataSource,
   ) {}
 
   /**
-   * BR-01: Commercial Request Registration
-   * - Any identified user with a valid role can register.
+   * BR-01 / RN-07 / RN-09: Commercial Request Registration
+   * - If creator has advisor role, auto-assigned to themselves.
+   * - If creator is admin or supervisor, remains unassigned (null) until explicit assignment.
+   * - Normalizes spaces in text fields.
    * - Initial status is ALWAYS PENDING.
-   * - If user has advisor role, the responsible advisor is strictly set to themselves.
+   * - Persists initial CREACION event in SolicitudHistorial in the same transaction.
    */
   async create(createRequestDto: CreateRequestDto, user: User): Promise<Request> {
-    const isAdvisor = user.role === UserRole.ADVISOR || user.role === UserRole.ASESOR;
-    const assignedAdvisor = isAdvisor
-      ? user.username
-      : (createRequestDto.advisor?.trim() || user.username);
+    const isAdvisor =
+      user.role === UserRole.ADVISOR || user.role === UserRole.ASESOR;
 
-    const newRequest = this.requestRepository.create({
-      client: createRequestDto.client.trim(),
-      description: createRequestDto.description.trim(),
-      advisor: assignedAdvisor,
-      status: RequestStatus.PENDING,
+    const assignedAdvisor = isAdvisor ? user.username : null;
+
+    const rawClient =
+      createRequestDto.cliente ?? createRequestDto.client ?? '';
+    const rawDescription =
+      createRequestDto.descripcion ?? createRequestDto.description ?? '';
+
+    const client = rawClient.trim().replace(/\s+/g, ' ');
+    const description = rawDescription.trim().replace(/\s+/g, ' ');
+
+    return await this.dataSource.transaction(async (manager) => {
+      const newRequest = manager.create(Request, {
+        client,
+        description,
+        advisor: assignedAdvisor,
+        status: RequestStatus.PENDING,
+        version: 1,
+      });
+
+      const savedRequest = await manager.save(Request, newRequest);
+
+      const historyEvent = manager.create(SolicitudHistorial, {
+        solicitudId: savedRequest.id,
+        tipoEvento: EventoTipo.CREACION,
+        valorAnterior: null,
+        valorNuevo: 'PENDIENTE',
+        usuarioActor: user.username,
+      });
+
+      await manager.save(SolicitudHistorial, historyEvent);
+
+      return savedRequest;
     });
-
-    return await this.requestRepository.save(newRequest);
   }
 
   /**
-   * BR-02: Query Commercial Requests
-   * - admin and supervisor: can query all requests.
-   * - advisor: can ONLY query requests assigned to their own user (filtered at DB level).
+   * BR-02 / RN-08: Query with Filters and Pagination
+   * - Advisors strictly only query requests assigned to their user (permission constraint at DB level).
+   * - Filter parameter `asesor` sent by an advisor cannot evade their access restrictions.
+   * - Admins and supervisors can query all and filter by advisor.
+   * - Supports filters: estado, asesor, cliente (case-insensitive partial match), desde, hasta.
+   * - Default pagination: page=1, limit=10 (limit capped at 100).
+   * - Returns collection and pagination metadata.
    */
-  async findAll(user: User): Promise<Request[]> {
-    if (user.role === UserRole.ADMIN || user.role === UserRole.SUPERVISOR) {
-      return await this.requestRepository.find({
-        order: { createdAt: 'DESC' },
+  async findAll(
+    filterDto: FilterRequestsDto,
+    user: User,
+  ): Promise<PaginatedResult<Request>> {
+    const queryBuilder = this.requestRepository.createQueryBuilder('request');
+
+    const isAdvisor =
+      user.role === UserRole.ADVISOR || user.role === UserRole.ASESOR;
+
+    // Permissions restriction at query builder level
+    if (isAdvisor) {
+      queryBuilder.andWhere('request.advisor = :userAdvisor', {
+        userAdvisor: user.username,
+      });
+    } else {
+      const advisorFilter = filterDto.asesor ?? filterDto.advisor;
+      if (advisorFilter && advisorFilter.trim().length > 0) {
+        queryBuilder.andWhere('request.advisor = :advisorFilter', {
+          advisorFilter: advisorFilter.trim(),
+        });
+      }
+    }
+
+    // Estado / status filter
+    const statusFilter = filterDto.estado ?? filterDto.status;
+    if (statusFilter) {
+      let mappedStatuses: string[] = [];
+      if (statusFilter === 'PENDIENTE' || statusFilter === 'PENDING') {
+        mappedStatuses = ['PENDING', 'PENDIENTE'];
+      } else if (
+        statusFilter === 'EN_GESTION' ||
+        statusFilter === 'IN_PROGRESS'
+      ) {
+        mappedStatuses = ['IN_PROGRESS', 'EN_GESTION'];
+      } else if (statusFilter === 'RESUELTA' || statusFilter === 'RESOLVED') {
+        mappedStatuses = ['RESOLVED', 'RESUELTA'];
+      }
+      if (mappedStatuses.length > 0) {
+        queryBuilder.andWhere('request.status IN (:...statuses)', {
+          statuses: mappedStatuses,
+        });
+      }
+    }
+
+    // Cliente / client filter (case-insensitive partial match)
+    const clientFilter = filterDto.cliente ?? filterDto.client;
+    if (clientFilter && clientFilter.trim().length > 0) {
+      queryBuilder.andWhere('LOWER(request.client) LIKE LOWER(:clientFilter)', {
+        clientFilter: `%${clientFilter.trim()}%`,
       });
     }
 
-    return await this.requestRepository.find({
-      where: { advisor: user.username },
-      order: { createdAt: 'DESC' },
-    });
+    // Date range filters over createdAt / creadaEn
+    const desde = filterDto.desde ?? filterDto.from;
+    if (desde) {
+      queryBuilder.andWhere('request.createdAt >= :desde', {
+        desde: new Date(desde),
+      });
+    }
+
+    const hasta = filterDto.hasta ?? filterDto.to;
+    if (hasta) {
+      queryBuilder.andWhere('request.createdAt <= :hasta', {
+        hasta: new Date(hasta),
+      });
+    }
+
+    // Pagination
+    const page = Number(filterDto.page) || 1;
+    const limit = Number(filterDto.limit) || 10;
+
+    queryBuilder.orderBy('request.createdAt', 'DESC');
+    queryBuilder.skip((page - 1) * limit);
+    queryBuilder.take(limit);
+
+    const [items, total] = await queryBuilder.getManyAndCount();
+    const totalPages = Math.ceil(total / limit) || 0;
+
+    return {
+      items,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages,
+      },
+      page,
+      limit,
+      total,
+      totalPages,
+    };
   }
 
   /**
    * BR-02: Individual Request Query
-   * - Validates existence.
-   * - If user is advisor, they can only view requests assigned to them.
    */
   async findOne(id: number, user: User): Promise<Request> {
     const request = await this.requestRepository.findOne({ where: { id } });
@@ -70,7 +201,8 @@ export class RequestsService {
       throw new NotFoundException(`Request with ID ${id} was not found.`);
     }
 
-    const isAdvisor = user.role === UserRole.ADVISOR || user.role === UserRole.ASESOR;
+    const isAdvisor =
+      user.role === UserRole.ADVISOR || user.role === UserRole.ASESOR;
     if (isAdvisor && request.advisor !== user.username) {
       throw new ForbiddenException(
         'Access denied: As an advisor you can only view requests assigned to your user.',
@@ -81,13 +213,73 @@ export class RequestsService {
   }
 
   /**
-   * BR-03: Status Transition
-   * - Supervisors and admins can update any existing request.
+   * RN-07: Assignment and Reassignment of Requests
+   * - Only admin and supervisor can assign or reassign requests.
+   * - Assigned user must exist and have advisor role.
+   * - Reassigning does not change request status.
+   * - Requests in RESOLVED status cannot be reassigned (HTTP 409 Conflict).
+   * - Changes and SolicitudHistorial entry are executed in the same transaction.
+   */
+  async assignAdvisor(
+    id: number,
+    assignDto: AssignRequestDto,
+    user: User,
+  ): Promise<Request> {
+    const targetAdvisorUsername = assignDto.getAssignedAdvisor();
+    const targetUser = IN_MEMORY_USERS[targetAdvisorUsername];
+
+    if (
+      !targetUser ||
+      (targetUser.role !== UserRole.ADVISOR &&
+        targetUser.role !== UserRole.ASESOR)
+    ) {
+      throw new BadRequestException(
+        `El usuario asignado '${targetAdvisorUsername}' no existe o no tiene el rol de asesor.`,
+      );
+    }
+
+    const request = await this.requestRepository.findOne({ where: { id } });
+
+    if (!request) {
+      throw new NotFoundException(`Request with ID ${id} was not found.`);
+    }
+
+    if (
+      request.status === RequestStatus.RESOLVED ||
+      (request.status as unknown as string) === 'RESUELTA'
+    ) {
+      throw new ConflictException(
+        'No se puede reasignar una solicitud en estado RESUELTA.',
+      );
+    }
+
+    return await this.dataSource.transaction(async (manager) => {
+      const valorAnterior = request.advisor || null;
+      request.advisor = targetUser.username;
+
+      const updatedRequest = await manager.save(Request, request);
+
+      const historyEvent = manager.create(SolicitudHistorial, {
+        solicitudId: request.id,
+        tipoEvento: EventoTipo.ASIGNACION,
+        valorAnterior,
+        valorNuevo: targetUser.username,
+        usuarioActor: user.username,
+      });
+
+      await manager.save(SolicitudHistorial, historyEvent);
+
+      return updatedRequest;
+    });
+  }
+
+  /**
+   * BR-03 / RN-09 / RN-10: Status Transition with Concurrency Control
    * - Advisors can only update their own requests.
-   * - Allowed transitions:
-   *   PENDING -> IN_PROGRESS
-   *   IN_PROGRESS -> RESOLVED
-   * - Rejects PENDING -> RESOLVED directly and reopening RESOLVED.
+   * - Allowed transitions: PENDING -> IN_PROGRESS -> RESOLVED.
+   * - Rejects direct PENDING -> RESOLVED and reopening RESOLVED.
+   * - Optimistic locking: verifies versionEsperada if supplied.
+   * - Increments version and registers ESTADO event in SolicitudHistorial in the same transaction.
    */
   async updateStatus(
     id: number,
@@ -100,18 +292,30 @@ export class RequestsService {
       throw new NotFoundException(`Request with ID ${id} was not found.`);
     }
 
-    const isAdvisor = user.role === UserRole.ADVISOR || user.role === UserRole.ASESOR;
+    const isAdvisor =
+      user.role === UserRole.ADVISOR || user.role === UserRole.ASESOR;
     if (isAdvisor && request.advisor !== user.username) {
       throw new ForbiddenException(
         'Access denied: As an advisor you cannot modify requests assigned to another user.',
       );
     }
 
+    // Optimistic locking check (RN-10)
+    const expectedVersion = updateStatusDto.getExpectedVersion();
+    if (expectedVersion !== undefined && expectedVersion !== request.version) {
+      throw new ConflictException(
+        'La solicitud fue modificada por otro usuario. Consulta la versión actual.',
+      );
+    }
+
     const currentStatus = request.status;
-    const newStatus = updateStatusDto.status;
+    const newStatus = updateStatusDto.getResolvedStatus();
 
     // Validation: cannot reopen or modify resolved requests
-    if (currentStatus === RequestStatus.RESOLVED) {
+    if (
+      currentStatus === RequestStatus.RESOLVED ||
+      (currentStatus as unknown as string) === 'RESUELTA'
+    ) {
       throw new BadRequestException(
         'Invalid transition: Cannot modify or reopen a request in RESOLVED status.',
       );
@@ -125,7 +329,10 @@ export class RequestsService {
     }
 
     // Validation: transitions from PENDING
-    if (currentStatus === RequestStatus.PENDING) {
+    if (
+      currentStatus === RequestStatus.PENDING ||
+      (currentStatus as unknown as string) === 'PENDIENTE'
+    ) {
       if (newStatus === RequestStatus.RESOLVED) {
         throw new BadRequestException(
           'Invalid transition: Cannot transition directly from PENDING to RESOLVED. It must first transition to IN_PROGRESS.',
@@ -139,7 +346,10 @@ export class RequestsService {
     }
 
     // Validation: transitions from IN_PROGRESS
-    if (currentStatus === RequestStatus.IN_PROGRESS) {
+    if (
+      currentStatus === RequestStatus.IN_PROGRESS ||
+      (currentStatus as unknown as string) === 'EN_GESTION'
+    ) {
       if (newStatus !== RequestStatus.RESOLVED) {
         throw new BadRequestException(
           'Invalid transition: From IN_PROGRESS you can only advance to RESOLVED.',
@@ -147,7 +357,55 @@ export class RequestsService {
       }
     }
 
-    request.status = newStatus;
-    return await this.requestRepository.save(request);
+    return await this.dataSource.transaction(async (manager) => {
+      const valorAnterior =
+        currentStatus === RequestStatus.PENDING ? 'PENDIENTE' : 'EN_GESTION';
+      const valorNuevo =
+        newStatus === RequestStatus.IN_PROGRESS ? 'EN_GESTION' : 'RESUELTA';
+
+      request.status = newStatus;
+      request.version = (request.version || 1) + 1;
+
+      const updatedRequest = await manager.save(Request, request);
+
+      const historyEvent = manager.create(SolicitudHistorial, {
+        solicitudId: request.id,
+        tipoEvento: EventoTipo.ESTADO,
+        valorAnterior,
+        valorNuevo,
+        usuarioActor: user.username,
+      });
+
+      await manager.save(SolicitudHistorial, historyEvent);
+
+      return updatedRequest;
+    });
+  }
+
+  /**
+   * RN-09: Audit History Query
+   * - Admin and supervisor can view history of any request.
+   * - Advisor can only view history of requests currently assigned to them.
+   * - Read-only for consumers.
+   */
+  async getHistory(id: number, user: User): Promise<SolicitudHistorial[]> {
+    const request = await this.requestRepository.findOne({ where: { id } });
+
+    if (!request) {
+      throw new NotFoundException(`Request with ID ${id} was not found.`);
+    }
+
+    const isAdvisor =
+      user.role === UserRole.ADVISOR || user.role === UserRole.ASESOR;
+    if (isAdvisor && request.advisor !== user.username) {
+      throw new ForbiddenException(
+        'Acceso denegado: Un asesor solo puede consultar el historial de solicitudes asignadas a sí mismo.',
+      );
+    }
+
+    return await this.historyRepository.find({
+      where: { solicitudId: id },
+      order: { fechaEvento: 'ASC', id: 'ASC' },
+    });
   }
 }

@@ -64,6 +64,26 @@ export const IN_MEMORY_USERS: Record<string, User> = {
     role: UserRole.ADVISOR,
     name: 'Asesor Dos',
   },
+  asesor01: {
+    username: 'asesor01',
+    role: UserRole.ADVISOR,
+    name: 'Asesor 01',
+  },
+  asesor02: {
+    username: 'asesor02',
+    role: UserRole.ADVISOR,
+    name: 'Asesor 02',
+  },
+  advisor01: {
+    username: 'advisor01',
+    role: UserRole.ADVISOR,
+    name: 'Advisor 01',
+  },
+  advisor02: {
+    username: 'advisor02',
+    role: UserRole.ADVISOR,
+    name: 'Advisor 02',
+  },
 };
 
 // Also export alias if anything imports USUARIOS_EN_MEMORIA
